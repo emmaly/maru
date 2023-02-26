@@ -48,7 +48,7 @@ func main() {
 		panic("No Discord API key provided")
 	}
 
-	personality := "Maru is a cheerful young adult woman. She is a technology enthusiast with a background in childcare and cooking."
+	personality := "Maru is a cheerful young adult. She is also a cat."
 	if config.OpenAI.Personality != "" {
 		personality = config.OpenAI.Personality
 	}
@@ -65,50 +65,74 @@ func main() {
 	conversation := make(map[string]map[string]string)
 
 	discord.AddHandler(func(s *discordgo.Session, m *discordgo.MessageCreate) {
-		if m.Author.ID == s.State.User.ID {
-			return
+		if m.Author.Bot {
+			return // we don't care about bots
 		}
-		prefix := regexp.MustCompile(`(?i)(^\s*maru\b[\s,.;:!]*|[\s,.;:!]*\bmaru\b[^a-z0-9]*\s*$)`)
-		if prefix.MatchString(m.Content) {
-			query := prefix.ReplaceAllString(m.Content, "")
 
-			channelConversations, ok := conversation[m.ChannelID]
-			if !ok {
-				channelConversations = make(map[string]string)
-				conversation[m.ChannelID] = channelConversations
+		// if m.Author.ID == s.State.User.ID {
+		// 	return // we don't care about ourselves
+		// }
+
+		{ // if the message starts with "maru (set|update)-personality" or ends with "maru (set|update)-personality", then we'll update the personality
+			prefix := regexp.MustCompile(`(?i)(^\s*maru\b[\s,.;:!]*((set|update)[\s+-]?personality|personality-?(set|update))\b[\s,.;:!]*|[\s,.;:!]*\b((set|update)[\s+-]?personality|personality[\s+-]?(set|update))\b[\s,.;:!]*maru\b[^a-z0-9]*\s*$)`)
+			if prefix.MatchString(m.Content) {
+				personality = prefix.ReplaceAllString(m.Content, "")
+				s.ChannelMessageSend(m.ChannelID, "Alright, I'll remember that!")
 			}
-			authorConversation, ok := channelConversations[m.Author.ID]
-			if !ok {
-				authorConversation = ""
-				channelConversations[m.Author.ID] = authorConversation
+		}
+
+		{ // if the message starts with "maru (get|set|update)-personality" or ends with "maru (get|set|update)-personality", then we'll get the personality
+			prefix := regexp.MustCompile(`(?i)(^\s*maru\b[\s,.;:!]*((get|set|update)[\s+-]?personality|personality[\s+-]?(get|set|update))\b[\s,.;:!]*|[\s,.;:!]*\b((get|set|update)[\s+-]?personality|personality[\s+-]?(get|set|update))\b[\s,.;:!]*maru\b[^a-z0-9]*\s*$)`)
+			if prefix.MatchString(m.Content) {
+				s.ChannelMessageSend(m.ChannelID, "```\n"+personality+"\n```")
+				return
 			}
-			authorConversation += "\nQ: " + query + "\nA:"
+		}
 
-			s.ChannelTyping(m.ChannelID)
+		{ // if the message starts with "maru" or ends with "maru", then we'll respond
+			prefix := regexp.MustCompile(`(?i)(^\s*maru\b[\s,.;:!]*|[\s,.;:!]*\bmaru\b[^a-z0-9]*\s*$)`)
+			if prefix.MatchString(m.Content) {
+				query := prefix.ReplaceAllString(m.Content, "")
 
-			if strings.ToLower(strings.TrimSpace(regexp.MustCompile(`(?i)[^a-z0-9\s]+`).ReplaceAllString(query, ""))) == "reset" {
-				query = ""
-				authorConversation = ""
-				s.ChannelMessageSend(m.ChannelID, "Sure, let's start over!")
-			}
+				channelConversations, ok := conversation[m.ChannelID]
+				if !ok {
+					channelConversations = make(map[string]string)
+					conversation[m.ChannelID] = channelConversations
+				}
+				authorConversation, ok := channelConversations[m.Author.ID]
+				if !ok {
+					authorConversation = ""
+					channelConversations[m.Author.ID] = authorConversation
+				}
+				authorConversation += "\nQ: " + query + "\nA:"
 
-			if query != "" {
-				completion, err := openai.CreateCompletion(ctx, gpt.CompletionRequest{
-					Model:     "text-davinci-003",
-					Prompt:    personality + "\n\n" + authorConversation,
-					MaxTokens: 500,
-					TopP:      1,
-				})
-				if err != nil {
-					panic(err)
+				s.ChannelTyping(m.ChannelID)
+
+				if strings.ToLower(strings.TrimSpace(regexp.MustCompile(`(?i)[^a-z0-9\s]+`).ReplaceAllString(query, ""))) == "reset" {
+					query = ""
+					authorConversation = ""
+					s.ChannelMessageSend(m.ChannelID, "Sure, let's start over!")
 				}
 
-				responseText := completion.Choices[0].Text
-				authorConversation += responseText
-				s.ChannelMessageSend(m.ChannelID, responseText)
+				if query != "" {
+					completion, err := openai.CreateCompletion(ctx, gpt.CompletionRequest{
+						Model:     "text-davinci-003",
+						Prompt:    personality + "\n\n" + authorConversation,
+						MaxTokens: 500,
+						TopP:      1,
+					})
+					if err != nil {
+						panic(err)
+					}
+
+					responseText := completion.Choices[0].Text
+					authorConversation += responseText
+					s.ChannelMessageSend(m.ChannelID, responseText)
+				}
+
+				channelConversations[m.Author.ID] = authorConversation
 			}
 
-			channelConversations[m.Author.ID] = authorConversation
 		}
 	})
 
