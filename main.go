@@ -138,9 +138,10 @@ func getConversation(config *Config, channelID string, authorID string) (*Conver
 			SharedConversation: config.Discord.SharedConversation,
 			Conversations:      make(map[string]*Conversation),
 		}
+		channel = config.Discord.Channels[channelID]
 	}
 	if channel.SharedConversation {
-		return channel.Conversations[""], channel
+		authorID = "" // shared conversation uses empty authorID
 	}
 
 	channel.mu.Lock()
