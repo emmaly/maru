@@ -4,7 +4,7 @@ go 1.20
 
 require (
 	github.com/bwmarrin/discordgo v0.27.0
-	github.com/sashabaranov/go-gpt3 v1.2.1
+	github.com/sashabaranov/go-gpt3 v1.3.0
 )
 
 require (

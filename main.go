@@ -3,7 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
-	"io/ioutil"
+	"io"
 	"log"
 	"os"
 	"regexp"
@@ -16,9 +16,10 @@ import (
 )
 
 type Config struct {
-	ConsoleLog bool          `json:"ConsoleLog"`
-	OpenAI     OpenAIConfig  `json:"OpenAI"`
-	Discord    DiscordConfig `json:"Discord"`
+	ConsoleLog   bool           `json:"ConsoleLog"`
+	OpenAI       OpenAIConfig   `json:"OpenAI"`
+	Discord      DiscordConfig  `json:"Discord"`
+	Instructions []*Instruction `json:"Instructions"`
 }
 
 type OpenAIConfig struct {
@@ -54,8 +55,13 @@ type Conversation struct {
 
 type Message struct {
 	Time    time.Time `json:"Time"`
+	Role    string    `json:"Role"`
 	Author  string    `json:"Author"`
 	Content string    `json:"Content"`
+}
+
+type Instruction struct {
+	Content string `json:"Content"`
 }
 
 func readConfig() *Config {
@@ -72,7 +78,7 @@ func readConfig() *Config {
 
 	// set defaults
 	if config.OpenAI.Model == "" {
-		config.OpenAI.Model = "text-davinci-003"
+		config.OpenAI.Model = "gpt-3.5-turbo"
 	}
 	if config.OpenAI.MaxTokens == 0 {
 		config.OpenAI.MaxTokens = 100
@@ -99,7 +105,7 @@ func main() {
 	if config.ConsoleLog {
 		log.SetOutput(os.Stdout)
 	} else {
-		log.SetOutput(ioutil.Discard)
+		log.SetOutput(io.Discard)
 	}
 
 	ctx := context.Background()
@@ -163,7 +169,7 @@ func (c *Conversation) reset() {
 	c.Messages = make([]*Message, 0)
 }
 
-func (c *Conversation) addMessage(timestamp time.Time, author string, content string) {
+func (c *Conversation) addMessage(timestamp time.Time, role string, author string, content string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.Messages == nil {
@@ -171,19 +177,56 @@ func (c *Conversation) addMessage(timestamp time.Time, author string, content st
 	}
 	c.Messages = append(c.Messages, &Message{
 		Time:    timestamp,
+		Role:    role,
 		Author:  author,
 		Content: content,
 	})
 }
 
-func (c *Conversation) getPrompt(personality string) string {
+func (c *Conversation) getPrompt(instructions []*Instruction, personality string) string {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+
 	prompt := personality + "\n\n"
+
+	for _, m := range instructions {
+		prompt = prompt + "\n\n" + m.Content
+	}
+
 	for _, m := range c.Messages {
 		prompt += m.Author + ": " + m.Content + "\n"
 	}
 	return prompt
+}
+
+func (c *Conversation) getChatCompletionMessages(instructions []*Instruction, personality string) ([]gpt.ChatCompletionMessage, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	messages := make([]gpt.ChatCompletionMessage, 0)
+
+	messages = append(messages, gpt.ChatCompletionMessage{
+		Role:    "system",
+		Content: personality,
+	})
+
+	for _, m := range instructions {
+		messages = append(messages, gpt.ChatCompletionMessage{
+			Role:    "system",
+			Content: m.Content,
+		})
+	}
+
+	if c.Messages != nil {
+		for _, m := range c.Messages {
+			messages = append(messages, gpt.ChatCompletionMessage{
+				Role:    m.Role,
+				Content: m.Author + ": " + m.Content,
+			})
+		}
+	}
+
+	return messages, nil
 }
 
 func messageCreate(config *Config, s *discordgo.Session, m *discordgo.MessageCreate, ctx context.Context, openai *gpt.Client) {
@@ -315,32 +358,87 @@ func messageCreate(config *Config, s *discordgo.Session, m *discordgo.MessageCre
 	// if we still have a query left, let's send it to OpenAI
 	if query != "" {
 		// append the new message to the conversation
-		conversation.addMessage(m.Timestamp, m.Author.Username, query)
+		conversation.addMessage(m.Timestamp, "user", m.Author.Username, query)
 
-		// get the entire prompt for OpenAI
-		prompt := conversation.getPrompt(personality)
+		// determine if we're a ChatCompletion or a Completion request, then do it
+		if strings.HasPrefix(config.OpenAI.Model, "gpt-3.5-turbo") {
+			// get ChatCompletionMessages from the conversation
+			messages, err := conversation.getChatCompletionMessages(config.Instructions, personality)
+			if err != nil {
+				panic(err)
+			}
 
-		// send the prompt to OpenAI
-		completion, err := openai.CreateCompletion(ctx, gpt.CompletionRequest{
-			Model:     model,
-			Prompt:    prompt,
-			MaxTokens: config.OpenAI.MaxTokens,
-			TopP:      config.OpenAI.TopP,
-		})
-		if err != nil {
-			panic(err)
+			// send the messages to OpenAI
+			completion, err := openai.CreateChatCompletion(ctx, gpt.ChatCompletionRequest{
+				Model:    model,
+				Messages: messages,
+				// MaxTokens: config.OpenAI.MaxTokens,
+				// TopP:      config.OpenAI.TopP,
+			})
+			if err != nil {
+				panic(err)
+			}
+
+			// collect the response data
+			authorRole := completion.Choices[0].Message.Role
+			responseText := regexp.MustCompile(`(?i)^\s*`+s.State.User.Username+`\s*:\s*`).ReplaceAllString(completion.Choices[0].Message.Content, "")
+
+			// store the message in the conversation
+			conversation.addMessage(time.Now(), authorRole, s.State.User.Username, responseText)
+
+			// send the response to the channel
+			s.ChannelMessageSend(m.ChannelID, responseText)
+		} else {
+			// get the entire prompt for OpenAI
+			prompt := conversation.getPrompt(config.Instructions, personality)
+
+			// send the prompt to OpenAI
+			completion, err := openai.CreateCompletion(ctx, gpt.CompletionRequest{
+				Model:     model,
+				Prompt:    prompt,
+				MaxTokens: config.OpenAI.MaxTokens,
+				TopP:      config.OpenAI.TopP,
+			})
+			if err != nil {
+				panic(err)
+			}
+
+			// remove the unwanted username prefix from the response
+			responseText := regexp.MustCompile(`(?i)^\s*`+s.State.User.Username+`\s*:\s*`).ReplaceAllString(completion.Choices[0].Text, "")
+
+			// if the response is a code block, then we need to add the code block delimiters
+			containsCodeIndentPrefixMatch := regexp.MustCompile(`(\t|\s{4})`)
+			codeIndentPrefixMatch := regexp.MustCompile(`^(\t|\s{4})`)
+			whitespaceOnlyLineMatch := regexp.MustCompile(`^\s*$`)
+			if containsCodeIndentPrefixMatch.MatchString(responseText) {
+				inFence := false
+				lines := strings.Split(responseText, "\n")
+				for i, line := range lines {
+					if !inFence && codeIndentPrefixMatch.MatchString(line) && !whitespaceOnlyLineMatch.MatchString(line) {
+						// first line of the code block
+						inFence = true
+						lines[i] = "```\n" + line
+					} else if inFence && !codeIndentPrefixMatch.MatchString(line) && !whitespaceOnlyLineMatch.MatchString(line) {
+						// last line of the code block
+						inFence = false
+						lines[i] = line + "\n```"
+					} else if inFence && i == len(lines)-1 {
+						// last line of the string altogether
+						inFence = false
+						lines[i] = line + "\n```"
+					}
+				}
+				responseText = strings.Join(lines, "\n")
+			}
+
+			// store the message in the conversation
+			conversation.addMessage(time.Now(), "assistant", s.State.User.Username, responseText)
+
+			// send the response to the channel
+			s.ChannelMessageSend(m.ChannelID, responseText)
 		}
-
-		// remove the unwanted username prefix from the response
-		responseText := regexp.MustCompile(`(?i)^\s*`+s.State.User.Username+`\s*:\s*`).ReplaceAllString(completion.Choices[0].Text, "")
-
-		// store the message in the conversation
-		conversation.addMessage(time.Now(), s.State.User.Username, responseText)
-
-		// send the response to the channel
-		s.ChannelMessageSend(m.ChannelID, responseText)
 	}
 
 	// log the conversation as it stands
-	log.Println("\nConversation:\n", conversation.getPrompt(personality))
+	log.Println("\nConversation:\n", conversation.getPrompt(config.Instructions, personality))
 }
